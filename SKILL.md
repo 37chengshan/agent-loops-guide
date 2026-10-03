@@ -1,103 +1,222 @@
 ---
-name: "agent-loops-guide"
-description: "设计 agent 循环系统的完整指南：以 Claude 团队 context engineering 演讲为底层逻辑（记忆四代演进、四条生产护栏、离线 dreaming 循环），融合 10+ 开源项目的实战模式（graphify reflect、claude-mem 三层检索、LangGraph checkpoint、Letta 记忆分层）。用于设计长期运行、多 agent 的记忆与自改进系统。"
-metadata: { "includeInPrompt": true }
-tagline: "让 agent 越跑越聪明的循环系统设计指南：dreaming 三档、护栏模板、检索规范。"
+name: agent-loops-guide
+description: Use when designing, debugging, or reviewing long-running or multi-agent workflows where work is chained, retried, verified, parallelized, remembered across sessions, or repeatedly fails in similar ways.
+metadata:
+  includeInPrompt: true
 ---
 
-# Agent Loops 指导手册
+# Agent Loops Guide
 
-> 底层逻辑来自 Claude 团队 context engineering 演讲：模型变强之后，真正决定产品能不能用的杠杆是 context engineering——给 agent 在任务当下能读到、能改、还能跨会话积累的信息。模式素材来自 10+ 开源项目的实测机制（见 `references/projects.md`）。
+## Overview
 
-一句话闭环：**白天 agent 读记忆、干活、把轨迹留下来 → 夜里 dreaming 从轨迹里抽出可复用规则，写回记忆 → 下一次 session 自动带上这些规则，等于系统在给自己写下一轮指令。**
+目标不是让人更勤快地盯 Agent，而是把人从中间步骤里拿掉，只留在**最高后果、最难撤销**的决策点。
 
-## 一、记忆的四代演进（够用就停）
+这个 skill 用一条架构公式约束设计：
 
-| 代 | 做法 | 何时用 | 开源范例 |
-|---|---|---|---|
-| 1. **CLAUDE.md** | 会话开始注入 markdown | 代码库约定、组织偏好 | superpowers 的初始指令；12-factor **Factor 2: Own your prompts** |
-| 2. **Memory tool** | agent 自己决定何时读/写/改 | 动态事实、轻量偏好 | mem0 的 `add`/`search`；Letta 的 self-editing memory blocks |
-| 3. **Skills** | front matter 先暴露标题，正文按需加载 | 大知识库 | claude-mem **三层 MCP 检索**（先扫书脊再抽书，见 §五） |
-| 4. **文件系统即记忆** | 记忆=markdown 文件，bash/grep 检索 | 长期、多 agent | graphify 的 `memory/` + `LESSONS.md` |
+```text
+可靠 Agent 系统
+= Graph（决定做哪些工作、依赖关系）
++ Loop（让单个工作单元自己收敛）
++ Gate（按爆炸半径决定能否通过）
++ Learning Edge（把已验证结果变成下一轮约束）
++ Memory / Dreaming（让约束跨 session 存活并被整理）
+```
 
-演进线：`CLAUDE.md → memory tool → skills → memory/`
-极限提醒：第 1 代文件一长就上下文膨胀、互相冲突——长到维护不动时就该升代，不要硬塞。
+一句话：**loop 在 node 内，graph 在 node 间；correction edge 修这一轮，learning edge 修以后每一轮。**
 
-## 二、生产四护栏（多 agent 长期跑必做）
+## When to Use
 
-1. **Versioning（版本）**：每次改动留版本——哪个 session、哪段 transcript、人还是 agent 写的，可回滚。
-   开源实现：LangGraph **checkpointing/time-travel**（最完整）；mem0 v3 **ADD-only**（只追加不覆盖，用"让冲突不可能发生"代替"解决冲突"）；graphify 用 **git merge driver** 做 union-merge。
-2. **Concurrency（并发）**：写前对内容 hash，提交时对不上就拒绝并重试（乐观锁）。
-   **开源基本空白**——这是本 skill 的补位点。模板见 `references/templates.md`（含可直接用的 Python 实现）。
-3. **Permissioning（权限）**：组织级知识只读，agent 草稿可写；画出"谁能写什么"分区表。
-   开源只有雏形：Letta 的 core（系统级）vs archival（agent 可写）记忆分区。**同样空白，模板见 references。**
-4. **Portability（可移植）**：干净 API 暴露记忆，不锁死 runtime；状态外置（12-factor **Factor 12: stateless reducer**——agent 本身无状态）。
+出现这些症状时加载本 skill：
 
-## 三、Dreaming：三档实现
+- Agent 每一步都要人确认，离开人就不可靠
+- pipeline 很长、很慢，但说不清哪些步骤真有依赖
+- 多 Agent 并行后只是得到多份相似意见
+- 失败会整批重跑，越修越乱
+- 用“模型置信度”决定自动放行
+- 同类错误跨 session 重复出现
+- 已经有 memory / vector DB，但系统并没有越来越会做
+- 想设计长期运行、可回滚、可审计的 agent workflow
 
-in-band 记忆（会话内自己管）有三硬伤：注意力被任务和整理拆开；看不到跨会话重复错误；记忆过期无人核对。Dreaming 是第二条进程：**批量、异步、单独占资源**，输入=记忆库+一段时间的轨迹，输出=整理过的记忆。
+不适合：一次性、完全确定性的短脚本。那种情况直接写代码，不要引入 Agent 架构。
 
-按投入从小到大三档：
+## Five Iron Laws
 
-**轻量档 — Factor 9（12-factor-agents）**
-`Compact Errors into Context Window`：不需要 dreaming 进程，每次失败当场提炼一条教训写回记忆。适合：单人小项目，今天就能加。
+### 1. 先写 Check，再写 Worker
 
-**标准档 — graphify reflect**
-`save-result --outcome useful|dead_end|corrected` 每次记录 verdict → `reflect` 聚合成 `LESSONS.md` → `reflect --if-stale` 做成幂等（没新输入就 no-op，随时可跑）。适合： nightly cron，一天复盘一次。
+一个 loop 只有四步：
 
-**重量档 — 演讲完整版**
-Verify（规则还成立吗？过期标 "code changed — re-verify" 自动失效）/ Organize（去重合并）/ Enrich（反复失败补成规则），输出提案 → **人工抽查后合并**（dreaming 只提案不合并，人审计）。适合：多 agent 生产系统。
+```text
+produce -> check -> correct -> repeat until green
+```
 
-互补关系：离线 dreaming 做"慢思考"（模式提炼），在线引擎做"快验证"（SuperMemory 的 auto-forget：过期即忘、矛盾即解）。
+**check 必须能失败。** 优先使用程序可判定条件：测试退出码、schema、diff 范围、source coverage、数值约束、静态检查。
 
-## 四、Learning edge（长回路，99% 的人缺这条）
+以下不算 check：
 
-短回路修这一轮（gate 打回单个单元）；**长回路修以后每一轮**：accepted 结果 → 提炼成约束 → 写回 **splitter 的 brief**（注意落点：不是 worker 指令，是决定"怎么切分工作"的 brief）。
+- “看起来不错”
+- “模型说自己很有把握”
+- “没有报错”
+- 另一个模型泛泛地说“通过”
 
-回退四件套（单元级，不退整批）：UNIT / VERDICT / REASON / EVIDENCE / SCOPE（"只修这个文件"，防扩散）。同一单元 3 次不过 → 问题在 plan，loop 看不见 plan，升级处理。
+若唯一可用的是模型判断，必须把 rubric 写成可观察证据，并把模型判断放在确定性证据之后。
 
-## 五、检索规范（抄 claude-mem）
+### 2. 只有真实数据依赖才算 Edge
 
-第 3 代记忆最具体的工程实践，三层渐进，token 预算写死：
+对 graph 中每一条箭头问：
 
-1. `search` — 紧凑索引（~50-100 token/条），先扫书脊
-2. `timeline` — 看上下文
-3. `get_observations` — 只取需要的全文
+> 下一个节点具体读取上一个节点的哪个输出变量？
 
-号称省 ~10x token。规则：**永远不许跳过第 1 层直接读全文**。
+答不出来，就没有 edge；可以并行，或者根本不该串起来。
 
-## 六、记忆分层（抄 Letta）
+不要把自然语言里的“然后”自动翻译成依赖。
 
-- **热**：常驻上下文（core memory：身份、当前任务、当日约束）
-- **温**：按需召回（archival：项目知识、历史决策）
-- **冷**： dreaming 归档（LESSONS.md：提炼后的规则，不过期检查）
+### 3. Deterministic Work 用 Code Node
 
-选型规则：**要溯源选图谱，要召回选向量**（graphify benchmark：LOCOMO recall@10 图谱 0.497 vs 纯向量 0.048）。
+节点只有四类：
 
-## 七、Gate（门禁）
+| Node | 作用 |
+|---|---|
+| Splitter | 把任务切成互相尽量独立的 unit |
+| Worker | 对一个 unit 做需要推理的工作 |
+| Code node | merge / sort / dedupe / compare / validate 等确定性变换 |
+| Gate | 基于证据决定 accept / return / escalate |
 
-按**爆炸半径**开，不按置信度（置信度是模型唯一能操纵的变量）：
-- 可逆且收敛（改文案、加测试）→ 先开
-- 可逆但影响面大（公共 util、schema）→ 确定性检查 + 干净轨迹
-- 难撤销（迁移、删除、动钱）→ **永远不开**，不是阈值高，是直接关闭
+若一个变换不需要“judge / decide / assess / summarize”，优先写代码，不要付模型的成本、延迟和方差。
 
-证据阅读顺序：确定性结果 → 本轮轨迹 → 该节点的历史回滚率 → 模型的自我评估（最后）。
+### 4. Return the Unit, Not the Batch
 
-## 八、落地顺序
+一个 unit 失败，只退那个 unit。返回包必须带：
 
-1. 先建 **gate**（能大声失败的东西；没 gate 的 graph 只是更快地生产未经验证的输出）
-2. 再画 lane（并行/依赖）
-3. learning edge 最后（得先有 accepted 结果才能提炼约束）
-4. 人只放在**后果最大 + 最不可逆**的一步：批 merge，不看中间过程
+```text
+UNIT     哪个工作单元
+VERDICT  red / corrected / accepted
+REASON   为什么失败
+EVIDENCE 可定位证据
+SCOPE    只允许改哪里
+```
 
-## 九、局限（诚实）
+默认最多 correction 3 次。三次仍失败，升级到 plan / splitter 层；不要让局部 loop 无限重试一个它看不见的规划错误。
 
-- 收益依赖 transcript 质量；dreaming 会写错 → 版本 + 人工抽查缺一不可
-- 改善的是上下文，不是模型能力
-- "97% fewer first-pass errors"类数字是客户侧观察，不是受控实验
+### 5. Gate 看 Blast Radius，不看 Confidence
 
-## references/
+按“错了以后有多难撤销”开 lane：
 
-- `projects.md` — 10 个开源项目的 loop 机制卡片 + 概念对照表
-- `dreaming-levels.md` — 三档 dreaming 的详细设计与 cron 模板
-- `templates.md` — 可直接抄的代码模板（hash 乐观锁、verdict 记录、权限分区表）
+| 风险 | 例子 | 策略 |
+|---|---|---|
+| 可逆且局部 | 文案、测试、隔离函数 | 可自动通过确定性 gate |
+| 可逆但影响面大 | 公共 util、schema、共享配置 | 更强 checks + 轨迹 + 必要的人审 |
+| 难撤销 | 数据迁移、删除、生产写入、资金动作 | lane 默认关闭，显式人工批准 |
+
+证据阅读顺序：**确定性结果 -> 本轮 trajectory -> 历史 rollback / failure -> 模型自评。**
+
+## Required Design Procedure
+
+使用本 skill 设计或审查系统时，按下面顺序输出，不要从“选模型 / 选向量库 / 加 memory”开始。
+
+### Step 1 — 定义 Unit 与 Green Condition
+
+先写：
+
+```text
+UNIT: 一个最小、可独立验证、可独立返工的工作单元
+INPUT: ...
+OUTPUT: ...
+GREEN: 一个或多个可失败条件
+MAX_ATTEMPTS: 默认 3
+```
+
+如果 GREEN 写不出来，先不要实现 loop。
+
+### Step 2 — 画 Graph，只保留 True Dependencies
+
+列出节点和 edge；对每条 edge 写明跨过去的变量。删除假依赖，找出能 fan-out 的工作。
+
+优先按**blast radius / 独立可验证性**切 unit，而不是机械地按文件夹、章节或输入顺序切。
+
+### Step 3 — 把 Loop 放进 Fallible Node
+
+每个需要推理且可能出错的 Worker 自己负责：produce -> check -> correct。Graph 不负责替单个节点“多想几遍”。
+
+### Step 4 — 设计两条 Return Path
+
+- **Correction edge（短）**：gate 把失败 unit 退给产生它的节点，修当前 run。
+- **Learning edge（长）**：accepted / corrected 结果提炼成 constraint，写回 splitter brief，改变未来 run 的切分和约束。
+
+只有 correction edge 的系统会越来越快，但不会越来越聪明。
+
+### Step 5 — 最后才加 Memory / Dreaming
+
+Memory 的任务不是替代 graph，而是让 learning edge 跨 session 存活。
+
+最小演进：
+
+```text
+静态指令文件 -> 可读写 memory tool -> 按需加载 skill -> 文件系统 / 外部状态
+```
+
+跨 session 重复足够多以后再加 dreaming：
+
+- 轻量：失败后当场压缩成一条 lesson
+- 标准：定期聚合 verdict / trajectory，产出 LESSONS
+- 重量：Verify / Organize / Enrich，产出 proposal，由人或受控 gate 合并
+
+详细实现见 `references/dreaming-levels.md`。
+
+### Step 6 — 给 Memory 加生产护栏
+
+长期、多 Agent 系统至少要有：
+
+- Versioning：谁、何时、基于什么证据改了什么
+- Concurrency：hash / optimistic lock，冲突时重读重试
+- Permissioning：共享规则、agent 草稿、dreaming proposal 分权
+- Portability：状态外置，接口清晰，不和某个 runtime 强绑定
+
+模板见 `references/templates.md`。
+
+### Step 7 — 把 Human 放在最高后果的一步
+
+人不要做图里的“常驻 reviewer node”。人应该批准：merge、ship、删除、迁移、生产写入、资金动作等高后果节点。
+
+目标不是 human-free，而是 **human-at-the-right-boundary**。
+
+## Output Contract
+
+当本 skill 被用于方案设计或 review，答案至少给出：
+
+1. **Unit**：最小工作单元是什么
+2. **Graph**：节点、真实依赖、可并行 lane
+3. **Checks**：每个关键节点的 machine-failable green condition
+4. **Correction**：失败 unit 如何返回，scope 如何限制
+5. **Gate**：按 blast radius 的 lane 策略
+6. **Learning Edge**：accepted/corrected 结果写回哪里
+7. **Memory/Dreaming**：是否需要、用哪一档、如何版本化
+8. **Human Approval Point**：唯一或少数人工批准点
+9. **Path Metrics**：attempts、return rate、rollback、latency、token/cost、首次通过率
+
+不要只评价最终答案；**测路径，而不只测落点。**
+
+## Common Failure Modes
+
+| 失败模式 | 修正 |
+|---|---|
+| 先做 Agent，再补 review | 先写可失败 check |
+| 所有节点都是 LLM | 确定性变换换成 code node |
+| 把“然后”当 edge | 必须指出跨 edge 的变量 |
+| 多 Agent 共用同一上下文互相抄答案 | worker 用独立 context，merge 后再汇总 |
+| 一处失败整批返工 | return unit, not batch |
+| 无限 self-correction | cap attempts，升级 plan |
+| 用 confidence 自动放行 | 按 blast radius 分 lane |
+| dreaming 直接改生产规则 | 只产 proposal，经过版本/权限/gate |
+| memory 越积越多 | 分热/温/冷层，定期 verify / compact |
+| verdict 只写报告不改变后续执行 | verdict 必须改变 route、scope 或未来 constraint |
+
+## References
+
+- `references/loop-graph-playbook.md` — 公式、node/edge 设计、gate 与 learning edge 的完整推导
+- `references/projects.md` — 10+ 开源项目的 loop / memory 机制卡片与概念对照
+- `references/dreaming-levels.md` — dreaming 三档设计与 cron 模板
+- `references/templates.md` — loop contract、edge audit、hash 乐观锁、verdict、权限与三层检索模板
+
+## Final Rule
+
+如果一个失败没有改变**当前 route**，它只是报告；如果一个被确认的教训没有改变**未来 brief**，系统迟早会再撞上它。
